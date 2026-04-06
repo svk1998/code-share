@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VoC Pulse — Anomaly Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
+
+:root {
+–bg:       #f5f4f0;
+–surface:  #ffffff;
+–card:     #ffffff;
+–border:   #e8e5df;
+–border2:  #d4cfc6;
+–text:     #1a1714;
+–muted:    #8a8480;
+–muted2:   #b5b0a8;
+–red:      #d63f3f;
+–red-bg:   #fdf1f1;
+–red-b:    #f5c6c6;
+–amber:    #c47a15;
+–amber-bg: #fdf8ee;
+–amber-b:  #f0d9a0;
+–green:    #2a7a4b;
+–green-bg: #f0faf4;
+–green-b:  #b2dfc4;
+–blue:     #1e5fa8;
+–blue-bg:  #f0f6ff;
+–blue-b:   #b3cfed;
+–sans: ‘DM Sans’, sans-serif;
+–mono: ‘DM Mono’, monospace;
+}
+
+- { margin:0; padding:0; box-sizing:border-box; }
+  html { scroll-behavior: smooth; }
+
+body {
+background: var(–bg);
+color: var(–text);
+font-family: var(–sans);
+min-height: 100vh;
+}
+
+/* ── TOPBAR ── */
+.topbar {
+background: var(–surface);
+border-bottom: 1px solid var(–border);
+padding: 0 28px;
+display: flex;
+align-items: center;
+justify-content: space-between;
+height: 56px;
+position: sticky;
+top: 0;
+z-index: 100;
+}
+
+.brand {
+display: flex;
+align-items: center;
+gap: 10px;
+}
+.brand-dot {
+width: 10px; height: 10px;
+border-radius: 50%;
+background: var(–red);
+animation: pulse 2s infinite;
+}
+@keyframes pulse {
+0%,100% { opacity:1; transform:scale(1); }
+50%      { opacity:0.5; transform:scale(1.3); }
+}
+.brand h1 { font-size:15px; font-weight:600; letter-spacing:-0.3px; }
+.brand span { font-size:12px; color:var(–muted); margin-left:6px; font-family:var(–mono); }
+
+.topbar-right {
+display:flex; align-items:center; gap:10px;
+}
+.week-badge {
+background: var(–bg);
+border: 1px solid var(–border2);
+border-radius: 6px;
+padding: 4px 12px;
+font-size: 12px;
+font-family: var(–mono);
+color: var(–muted);
+}
+
+/* ── LAYOUT ── */
+.main { display:flex; height:calc(100vh - 56px); }
+
+/* ── SIDEBAR ── */
+.sidebar {
+width: 220px;
+background: var(–surface);
+border-right: 1px solid var(–border);
+flex-shrink: 0;
+padding: 20px 0;
+display:flex; flex-direction:column; gap:4px;
+}
+
+.sidebar-label {
+font-size:10px; font-weight:600; letter-spacing:1.2px;
+color:var(–muted2); text-transform:uppercase;
+padding: 0 18px; margin: 12px 0 6px;
+}
+
+.nav-item {
+display:flex; align-items:center; gap:10px;
+padding: 8px 18px;
+font-size:13px; font-weight:500;
+color:var(–muted);
+cursor:pointer;
+border-radius:0;
+transition: all 0.15s;
+border-left: 3px solid transparent;
+user-select:none;
+}
+.nav-item:hover { background:#f9f8f6; color:var(–text); }
+.nav-item.active {
+background: #f9f8f6;
+color: var(–text);
+border-left-color: var(–text);
+}
+.nav-item .nav-icon { font-size:14px; width:18px; text-align:center; }
+.nav-count {
+margin-left:auto;
+background: var(–red-bg);
+color: var(–red);
+border: 1px solid var(–red-b);
+border-radius:20px;
+font-size:10px; font-weight:600;
+padding:1px 7px;
+font-family:var(–mono);
+}
+.nav-count.amber {
+background:var(–amber-bg); color:var(–amber); border-color:var(–amber-b);
+}
+.nav-count.green {
+background:var(–green-bg); color:var(–green); border-color:var(–green-b);
+}
+
+/* ── CONTENT ── */
+.content {
+flex:1; overflow-y:auto;
+padding: 28px;
+display:flex; flex-direction:column; gap:22px;
+}
+
+.view { display:none; }
+.view.active { display:contents; }
+
+/* ── SECTION HEADER ── */
+.section-header {
+display:flex; justify-content:space-between; align-items:center;
+}
+.section-header h2 { font-size:18px; font-weight:600; letter-spacing:-0.3px; }
+.section-header p { font-size:12px; color:var(–muted); margin-top:2px; }
+
+/* ── KPI CARDS ── */
+.kpi-row {
+display:grid;
+grid-template-columns: repeat(4, 1fr);
+gap:14px;
+}
+@media(max-width:900px){ .kpi-row { grid-template-columns:repeat(2,1fr); } }
+@media(max-width:560px){ .kpi-row { grid-template-columns:1fr; } }
+
+.kpi-card {
+background:var(–card);
+border:1px solid var(–border);
+border-radius:12px;
+padding:18px 20px;
+animation: fadeUp 0.4s ease both;
+}
+@keyframes fadeUp {
+from { opacity:0; transform:translateY(8px); }
+to   { opacity:1; transform:translateY(0); }
+}
+.kpi-card:nth-child(2){animation-delay:.06s}
+.kpi-card:nth-child(3){animation-delay:.12s}
+.kpi-card:nth-child(4){animation-delay:.18s}
+
+.kpi-label {
+font-size:11px; font-weight:600; text-transform:uppercase;
+letter-spacing:0.8px; color:var(–muted); margin-bottom:10px;
+}
+.kpi-val {
+font-size:28px; font-weight:600; letter-spacing:-1px;
+line-height:1;
+}
+.kpi-sub {
+font-size:11px; color:var(–muted); margin-top:6px;
+display:flex; align-items:center; gap:4px;
+}
+.kpi-pill {
+display:inline-flex; align-items:center;
+padding:1px 7px; border-radius:20px;
+font-size:10px; font-weight:600; font-family:var(–mono);
+}
+.pill-red   { background:var(–red-bg); color:var(–red); border:1px solid var(–red-b); }
+.pill-amber { background:var(–amber-bg); color:var(–amber); border:1px solid var(–amber-b); }
+.pill-green { background:var(–green-bg); color:var(–green); border:1px solid var(–green-b); }
+.pill-blue  { background:var(–blue-bg); color:var(–blue); border:1px solid var(–blue-b); }
+
+/* ── ALERT FEED ── */
+.card {
+background:var(–card);
+border:1px solid var(–border);
+border-radius:12px;
+overflow:hidden;
+animation: fadeUp 0.4s ease both;
+}
+.card-header {
+padding:14px 20px;
+border-bottom:1px solid var(–border);
+display:flex; justify-content:space-between; align-items:center;
+}
+.card-title {
+font-size:13px; font-weight:600;
+}
+.card-sub { font-size:11px; color:var(–muted); margin-top:1px; }
+
+.alert-feed { display:flex; flex-direction:column; }
+
+.alert-row {
+display:grid;
+grid-template-columns: 6px 1fr auto;
+gap:0 14px;
+align-items:center;
+padding:14px 20px;
+border-bottom:1px solid var(–border);
+transition:background 0.15s;
+cursor:pointer;
+}
+.alert-row:last-child { border-bottom:none; }
+.alert-row:hover { background:#fafaf8; }
+
+.alert-bar {
+width:4px; height:36px; border-radius:4px;
+align-self:center;
+}
+.bar-red   { background:var(–red); }
+.bar-amber { background:var(–amber); }
+.bar-green { background:var(–green); }
+
+.alert-main { display:flex; flex-direction:column; gap:3px; }
+.alert-title { font-size:13px; font-weight:500; }
+.alert-meta {
+font-size:11px; color:var(–muted);
+display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+}
+.alert-meta-sep { color:var(–border2); }
+
+.alert-right { display:flex; flex-direction:column; align-items:flex-end; gap:4px; }
+.z-chip {
+font-family:var(–mono); font-size:13px; font-weight:500;
+padding:3px 10px; border-radius:6px;
+}
+.z-red   { background:var(–red-bg); color:var(–red); }
+.z-amber { background:var(–amber-bg); color:var(–amber); }
+.z-green { background:var(–green-bg); color:var(–green); }
+
+/* ── 2-COL GRID ── */
+.two-col { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+@media(max-width:800px){ .two-col { grid-template-columns:1fr; } }
+
+/* ── CHART WRAP ── */
+.chart-pad { padding:20px; }
+.chart-wrap { position:relative; height:220px; }
+
+/* ── CATEGORY BARS ── */
+.cat-list { display:flex; flex-direction:column; gap:0; padding:4px 0; }
+.cat-row {
+padding:12px 20px;
+display:grid; grid-template-columns:130px 1fr 56px 60px;
+align-items:center; gap:12px;
+border-bottom:1px solid var(–border);
+transition:background 0.1s;
+}
+.cat-row:last-child{border-bottom:none;}
+.cat-row:hover{background:#fafaf8;}
+.cat-name { font-size:12px; font-weight:500; color:var(–text); }
+.bar-track {
+background:#f0ede7; border-radius:4px; height:8px; overflow:hidden;
+}
+.bar-fill {
+height:100%; border-radius:4px;
+transition: width 0.8s cubic-bezier(.25,.8,.25,1);
+}
+.cat-count { font-size:12px; font-family:var(–mono); color:var(–muted); text-align:right; }
+
+/* ── BASELINE TABLE ── */
+.tbl { width:100%; border-collapse:collapse; font-size:12px; }
+.tbl th {
+text-align:left; padding:10px 16px;
+font-size:10px; font-weight:600; text-transform:uppercase;
+letter-spacing:0.8px; color:var(–muted2);
+border-bottom:1px solid var(–border); background:#fafaf8;
+}
+.tbl td {
+padding:11px 16px;
+border-bottom:1px solid var(–border);
+font-family:var(–mono); font-size:12px;
+}
+.tbl td:first-child { font-family:var(–sans); font-weight:500; }
+.tbl tr:last-child td { border-bottom:none; }
+.tbl tr:hover td { background:#fafaf8; }
+
+.mu-pill {
+display:inline-block;
+background:var(–blue-bg); color:var(–blue);
+border:1px solid var(–blue-b);
+border-radius:4px; padding:1px 8px;
+font-size:11px;
+}
+.sigma-pill {
+display:inline-block;
+background:#f9f8f6; color:var(–muted);
+border:1px solid var(–border2);
+border-radius:4px; padding:1px 8px;
+font-size:11px;
+}
+.window-txt { color:var(–muted); font-size:11px; font-family:var(–sans); }
+
+/* ── EXPLAIN SECTION ── */
+.explain-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }
+@media(max-width:750px){ .explain-grid { grid-template-columns:1fr; } }
+
+.explain-card {
+background:var(–card); border:1px solid var(–border);
+border-radius:12px; padding:20px;
+animation:fadeUp 0.4s ease both;
+}
+.explain-card:nth-child(2){animation-delay:.08s}
+.explain-card:nth-child(3){animation-delay:.16s}
+
+.explain-icon { font-size:22px; margin-bottom:10px; }
+.explain-card h3 { font-size:13px; font-weight:600; margin-bottom:6px; }
+.explain-card p { font-size:12px; color:var(–muted); line-height:1.65; }
+.explain-formula {
+margin-top:12px;
+background:var(–bg);
+border:1px solid var(–border);
+border-radius:6px; padding:8px 12px;
+font-family:var(–mono); font-size:12px; color:var(–text);
+}
+.highlight-red   { color:var(–red); font-weight:600; }
+.highlight-amber { color:var(–amber); font-weight:600; }
+.highlight-green { color:var(–green); font-weight:600; }
+
+/* ── PRODUCT BREAKDOWN ── */
+.prod-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }
+@media(max-width:800px){ .prod-grid { grid-template-columns:1fr; } }
+
+.prod-card {
+background:var(–card); border:1px solid var(–border);
+border-radius:12px; padding:0; overflow:hidden;
+animation:fadeUp 0.4s ease both;
+}
+.prod-header {
+padding:14px 18px 12px;
+border-bottom:1px solid var(–border);
+display:flex; justify-content:space-between; align-items:center;
+}
+.prod-name { font-size:13px; font-weight:600; }
+.prod-total { font-size:11px; color:var(–muted); font-family:var(–mono); }
+.prod-cats { padding:10px 0; }
+.prod-cat-row {
+display:flex; align-items:center; gap:10px;
+padding:7px 18px;
+}
+.prod-cat-name { font-size:11px; color:var(–muted); width:90px; flex-shrink:0; }
+.prod-bar-track { flex:1; height:6px; background:#f0ede7; border-radius:3px; overflow:hidden; }
+.prod-bar-fill  { height:100%; border-radius:3px; }
+.prod-cat-num   { font-size:11px; font-family:var(–mono); color:var(–text); width:24px; text-align:right; }
+
+/* scrollbar */
+::-webkit-scrollbar { width:6px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(–border2); border-radius:3px; }
+</style>
+
+</head>
+<body>
+
+<!-- TOPBAR -->
+
+<div class="topbar">
+  <div class="brand">
+    <div class="brand-dot"></div>
+    <h1>VoC Pulse</h1>
+    <span>Anomaly Intelligence</span>
+  </div>
+  <div class="topbar-right">
+    <div class="week-badge">Week 13 · Apr 07, 2025</div>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- SIDEBAR -->
+
+  <nav class="sidebar">
+    <div class="sidebar-label">Monitor</div>
+    <div class="nav-item active" onclick="showView('overview')">
+      <span class="nav-icon">◉</span> Overview
+    </div>
+    <div class="nav-item" onclick="showView('alerts')">
+      <span class="nav-icon">⚡</span> Alert Feed
+      <span class="nav-count">3</span>
+    </div>
+    <div class="nav-item" onclick="showView('trends')">
+      <span class="nav-icon">↗</span> Trends
+    </div>
+
+```
+<div class="sidebar-label">Analyse</div>
+<div class="nav-item" onclick="showView('baseline')">
+  <span class="nav-icon">≈</span> Baseline
+</div>
+<div class="nav-item" onclick="showView('products')">
+  <span class="nav-icon">▤</span> By Product
+</div>
+
+<div class="sidebar-label">Learn</div>
+<div class="nav-item" onclick="showView('howit')">
+  <span class="nav-icon">?</span> How It Works
+</div>
+```
+
+  </nav>
+
+  <!-- CONTENT -->
+
+  <div class="content">
+
+```
+<!-- ══ OVERVIEW ══ -->
+<div id="view-overview" class="view active">
+
+  <div class="section-header">
+    <div>
+      <h2>Weekly Overview</h2>
+      <p>W13 · Compared to 12-week baseline</p>
+    </div>
+  </div>
+
+  <div class="kpi-row">
+    <div class="kpi-card">
+      <div class="kpi-label">Total VoC</div>
+      <div class="kpi-val">184</div>
+      <div class="kpi-sub">
+        <span class="kpi-pill pill-red">↑ 38% vs avg</span>
+      </div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Critical Anomalies</div>
+      <div class="kpi-val" style="color:var(--red)">3</div>
+      <div class="kpi-sub">
+        <span class="kpi-pill pill-red">|Z| &gt; 3</span>&nbsp;this week
+      </div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Warnings</div>
+      <div class="kpi-val" style="color:var(--amber)">2</div>
+      <div class="kpi-sub">
+        <span class="kpi-pill pill-amber">2 &lt; |Z| ≤ 3</span>
+      </div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Normal Categories</div>
+      <div class="kpi-val" style="color:var(--green)">7</div>
+      <div class="kpi-sub">
+        <span class="kpi-pill pill-green">|Z| ≤ 2</span>&nbsp;stable
+      </div>
+    </div>
+  </div>
+
+  <!-- Category breakdown -->
+  <div class="two-col">
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Category Distribution</div>
+          <div class="card-sub">This week's VoC by type</div>
+        </div>
+      </div>
+      <div class="cat-list" id="catList"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Anomaly Status</div>
+          <div class="card-sub">Z-score by category this week</div>
+        </div>
+      </div>
+      <div class="cat-list" id="anomalyList"></div>
+    </div>
+  </div>
+
+  <!-- Top alerts preview -->
+  <div class="card">
+    <div class="card-header">
+      <div>
+        <div class="card-title">🚨 Active Alerts</div>
+        <div class="card-sub">Critical and warning anomalies requiring attention</div>
+      </div>
+      <span class="kpi-pill pill-red" style="cursor:pointer" onclick="showView('alerts')">View all →</span>
+    </div>
+    <div class="alert-feed" id="overviewAlerts"></div>
+  </div>
+
+</div>
+
+<!-- ══ ALERT FEED ══ -->
+<div id="view-alerts" class="view">
+  <div class="section-header">
+    <div>
+      <h2>Alert Feed</h2>
+      <p>All flagged anomalies — sorted by Z-score severity</p>
+    </div>
+  </div>
+  <div class="card">
+    <div class="alert-feed" id="fullAlerts"></div>
+  </div>
+</div>
+
+<!-- ══ TRENDS ══ -->
+<div id="view-trends" class="view">
+  <div class="section-header">
+    <div><h2>Trends</h2><p>12-week rolling view per category</p></div>
+  </div>
+  <div class="two-col">
+    <div class="card">
+      <div class="card-header"><div class="card-title">Complaint Volume</div></div>
+      <div class="chart-pad"><div class="chart-wrap"><canvas id="chartComplaint"></canvas></div></div>
+    </div>
+    <div class="card">
+      <div class="card-header"><div class="card-title">Bug Volume</div></div>
+      <div class="chart-pad"><div class="chart-wrap"><canvas id="chartBug"></canvas></div></div>
+    </div>
+    <div class="card">
+      <div class="card-header"><div class="card-title">Feature Requests</div></div>
+      <div class="chart-pad"><div class="chart-wrap"><canvas id="chartFeature"></canvas></div></div>
+    </div>
+    <div class="card">
+      <div class="card-header"><div class="card-title">Praise</div></div>
+      <div class="chart-pad"><div class="chart-wrap"><canvas id="chartPraise"></canvas></div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ BASELINE ══ -->
+<div id="view-baseline" class="view">
+  <div class="section-header">
+    <div><h2>Baseline Registry</h2><p>μ and σ used for Z-score computation · 12-week rolling window</p></div>
+  </div>
+  <div class="card">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>Category</th>
+          <th>Product</th>
+          <th>Mean (μ)</th>
+          <th>Std Dev (σ)</th>
+          <th>Window</th>
+          <th>Weeks</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="baselineBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ══ BY PRODUCT ══ -->
+<div id="view-products" class="view">
+  <div class="section-header">
+    <div><h2>By Product</h2><p>VoC volume breakdown per product this week</p></div>
+  </div>
+  <div class="prod-grid" id="prodGrid"></div>
+</div>
+
+<!-- ══ HOW IT WORKS ══ -->
+<div id="view-howit" class="view">
+  <div class="section-header">
+    <div><h2>How It Works</h2><p>Understanding the anomaly detection logic</p></div>
+  </div>
+
+  <div class="explain-grid">
+    <div class="explain-card">
+      <div class="explain-icon">📊</div>
+      <h3>What is a Z-Score?</h3>
+      <p>Z-score tells you how far this week's count is from the historical average, measured in standard deviations. The further it is, the more unusual it is.</p>
+      <div class="explain-formula">Z = (this_week − avg) / std_dev</div>
+    </div>
+    <div class="explain-card">
+      <div class="explain-icon">🎯</div>
+      <h3>Alert Thresholds</h3>
+      <p>
+        <span class="highlight-green">✅ Z ≤ 2</span> — Normal. Expected range.<br><br>
+        <span class="highlight-amber">⚠️ 2 &lt; Z ≤ 3</span> — Warning. Elevated. Worth reviewing.<br><br>
+        <span class="highlight-red">🚨 Z &gt; 3</span> — Critical. Rare spike. Act now.
+      </p>
+    </div>
+    <div class="explain-card">
+      <div class="explain-icon">🔄</div>
+      <h3>Baseline Updates</h3>
+      <p>The average and std dev are recomputed every week using the last 12 normal weeks. Anomalous weeks are excluded — so spikes don't corrupt your baseline.</p>
+      <div class="explain-formula">window = last 12 non-anomaly weeks</div>
+    </div>
+  </div>
+
+  <!-- Visual Z scale -->
+  <div class="card" style="padding:24px;">
+    <div class="card-title" style="margin-bottom:18px;">Z-Score Visual Scale</div>
+    <div style="position:relative; height:48px; background:linear-gradient(to right, #1e5fa8, #2a7a4b 35%, #2a7a4b 65%, #c47a15 80%, #d63f3f); border-radius:8px; overflow:hidden;">
+      <!-- markers -->
+      <div style="position:absolute;top:0;left:50%;width:2px;height:100%;background:rgba(255,255,255,0.4);"></div>
+      <div style="position:absolute;top:0;left:calc(50% + 16.67%);width:2px;height:100%;background:rgba(255,255,255,0.5);"></div>
+      <div style="position:absolute;top:0;left:calc(50% - 16.67%);width:2px;height:100%;background:rgba(255,255,255,0.5);"></div>
+      <div style="position:absolute;top:0;left:calc(50% + 25%);width:2px;height:100%;background:rgba(255,255,255,0.7);"></div>
+      <div style="position:absolute;top:0;left:calc(50% - 25%);width:2px;height:100%;background:rgba(255,255,255,0.7);"></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;margin-top:6px;font-size:11px;font-family:var(--mono);color:var(--muted);">
+      <span>−4 (unusually low)</span>
+      <span>−2</span>
+      <span style="color:var(--green);font-weight:600;">0 (normal)</span>
+      <span>+2</span>
+      <span>+4 (spike 🚨)</span>
+    </div>
+    <div style="display:flex;gap:20px;margin-top:16px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
+        <div style="width:12px;height:12px;border-radius:3px;background:var(--green)"></div>
+        Normal — safe to update baseline
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
+        <div style="width:12px;height:12px;border-radius:3px;background:var(--amber)"></div>
+        Warning — manual review
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
+        <div style="width:12px;height:12px;border-radius:3px;background:var(--red)"></div>
+        Critical — excluded from baseline
+      </div>
+    </div>
+  </div>
+</div>
+```
+
+  </div><!-- /content -->
+</div><!-- /main -->
+
+<script>
+// ── DATA ──
+const WEEKS = ['W02','W03','W04','W05','W06','W07','W08','W09','W10','W11','W12','W13'];
+
+const history = {
+  Complaint:   [22,19,24,21,18,23,20,25,22,51,24,21],
+  Bug:         [8,6,9,7,10,8,6,9,7,28,8,7],
+  'Feature Req':[14,16,13,15,18,14,17,13,16,15,14,33],
+  Praise:      [18,20,17,22,19,21,18,23,20,11,21,19],
+  'UI Issue':  [5,6,4,7,5,6,5,8,6,7,5,6],
+};
+
+const categories = Object.keys(history);
+
+function mean(arr){ return arr.reduce((a,b)=>a+b,0)/arr.length; }
+function std(arr){
+  const m=mean(arr);
+  return Math.sqrt(arr.map(x=>(x-m)**2).reduce((a,b)=>a+b,0)/arr.length);
+}
+function zscore(x,m,s){ return s===0?0:(x-m)/s; }
+
+// Baseline = first 11 weeks (exclude last = current week)
+const baseline = {};
+categories.forEach(cat=>{
+  const hist = history[cat].slice(0,11);
+  baseline[cat] = { mu: mean(hist), sigma: std(hist) };
+});
+
+// Current week values
+const currentWeek = {};
+categories.forEach(cat=>{
+  currentWeek[cat] = history[cat][history[cat].length-1];
+});
+
+// Z for current week
+const currentZ = {};
+categories.forEach(cat=>{
+  const {mu,sigma} = baseline[cat];
+  currentZ[cat] = zscore(currentWeek[cat], mu, sigma);
+});
+
+function alertLevel(z){
+  const az=Math.abs(z);
+  if(az>3) return 'critical';
+  if(az>2) return 'warning';
+  return 'normal';
+}
+
+// Products
+const products = {
+  'Mobile App':  { Complaint:12, Bug:5, 'Feature Req':20, Praise:10, 'UI Issue':3 },
+  'Web Portal':  { Complaint:6, Bug:2, 'Feature Req':9, Praise:7, 'UI Issue':2 },
+  'API':         { Complaint:3, Bug:0, 'Feature Req':4, Praise:2, 'UI Issue':1 },
+};
+
+// ── ALERT ROWS ──
+function buildAlertRow(cat, z, count){
+  const level = alertLevel(z);
+  const barCls = {critical:'bar-red',warning:'bar-amber',normal:'bar-green'}[level];
+  const zCls   = {critical:'z-red',  warning:'z-amber',  normal:'z-green'}[level];
+  const label  = {critical:'🚨 CRITICAL',warning:'⚠️ WARNING',normal:'✅ NORMAL'}[level];
+  const {mu, sigma} = baseline[cat];
+  return `
+    <div class="alert-row">
+      <div class="alert-bar ${barCls}"></div>
+      <div class="alert-main">
+        <div class="alert-title">${cat}</div>
+        <div class="alert-meta">
+          <span>${label}</span>
+          <span class="alert-meta-sep">·</span>
+          <span>Count: <b>${count}</b></span>
+          <span class="alert-meta-sep">·</span>
+          <span>Avg: ${mu.toFixed(1)} ± ${sigma.toFixed(1)}</span>
+          <span class="alert-meta-sep">·</span>
+          <span>Expected range: ${(mu-2*sigma).toFixed(0)}–${(mu+2*sigma).toFixed(0)}</span>
+        </div>
+      </div>
+      <div class="alert-right">
+        <div class="z-chip ${zCls}">Z = ${z.toFixed(2)}</div>
+        <div style="font-size:10px;color:var(--muted);font-family:var(--mono)">W13</div>
+      </div>
+    </div>`;
+}
+
+// ── OVERVIEW ──
+// Category distribution
+const catColors = ['#d63f3f','#c47a15','#2a7a4b','#1e5fa8','#7c5cbf'];
+const maxCount = Math.max(...categories.map(c=>currentWeek[c]));
+
+const catList = document.getElementById('catList');
+categories.forEach((cat,i)=>{
+  const count=currentWeek[cat];
+  const pct = (count/maxCount*100).toFixed(0);
+  catList.innerHTML += `
+    <div class="cat-row">
+      <div class="cat-name">${cat}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${catColors[i]};"></div></div>
+      <div class="cat-count">${count}</div>
+    </div>`;
+});
+
+// Anomaly status list
+const anomalyList = document.getElementById('anomalyList');
+categories.forEach(cat=>{
+  const z = currentZ[cat];
+  const level = alertLevel(z);
+  const zCls = {critical:'z-red',warning:'z-amber',normal:'z-green'}[level];
+  const icon  = {critical:'🚨',warning:'⚠️',normal:'✅'}[level];
+  anomalyList.innerHTML += `
+    <div class="cat-row">
+      <div class="cat-name">${cat}</div>
+      <div style="font-size:12px;color:var(--muted)">${icon} ${level.charAt(0).toUpperCase()+level.slice(1)}</div>
+      <div></div>
+      <div><span class="z-chip ${zCls}" style="font-size:11px;">Z=${z.toFixed(1)}</span></div>
+    </div>`;
+});
+
+// Overview alerts — critical + warning only
+const sorted = categories
+  .map(cat=>({cat, z:currentZ[cat], count:currentWeek[cat]}))
+  .sort((a,b)=>Math.abs(b.z)-Math.abs(a.z));
+
+const overviewAlerts = document.getElementById('overviewAlerts');
+sorted.filter(r=>alertLevel(r.z)!=='normal').forEach(r=>{
+  overviewAlerts.innerHTML += buildAlertRow(r.cat, r.z, r.count);
+});
+if(overviewAlerts.innerHTML===''){
+  overviewAlerts.innerHTML = '<div style="padding:20px;font-size:13px;color:var(--muted);">✅ No anomalies this week.</div>';
+}
+
+// Full alert feed
+const fullAlerts = document.getElementById('fullAlerts');
+sorted.forEach(r=>{
+  fullAlerts.innerHTML += buildAlertRow(r.cat, r.z, r.count);
+});
+
+// ── BASELINE TABLE ──
+const baselineBody = document.getElementById('baselineBody');
+const prodKeys = Object.keys(products);
+categories.forEach(cat=>{
+  const {mu,sigma} = baseline[cat];
+  prodKeys.forEach((prod,pi)=>{
+    const level = alertLevel(currentZ[cat]);
+    const pill = {
+      critical:`<span class="kpi-pill pill-red">Anomaly</span>`,
+      warning: `<span class="kpi-pill pill-amber">Warning</span>`,
+      normal:  `<span class="kpi-pill pill-green">Stable</span>`,
+    }[level];
+    baselineBody.innerHTML += `
+      <tr>
+        <td>${cat}</td>
+        <td style="font-family:var(--sans)">${prod}</td>
+        <td><span class="mu-pill">${mu.toFixed(2)}</span></td>
+        <td><span class="sigma-pill">±${sigma.toFixed(2)}</span></td>
+        <td class="window-txt">W02 – W12</td>
+        <td style="color:var(--muted)">11</td>
+        <td>${pi===0?pill:''}</td>
+      </tr>`;
+  });
+});
+
+// ── BY PRODUCT ──
+const prodGrid = document.getElementById('prodGrid');
+const prodColors = ['#d63f3f','#c47a15','#2a7a4b','#1e5fa8','#7c5cbf'];
+Object.entries(products).forEach(([prod, cats])=>{
+  const total = Object.values(cats).reduce((a,b)=>a+b,0);
+  const maxC  = Math.max(...Object.values(cats));
+  const rows  = categories.map((cat,i)=>`
+    <div class="prod-cat-row">
+      <div class="prod-cat-name">${cat}</div>
+      <div class="prod-bar-track">
+        <div class="prod-bar-fill" style="width:${((cats[cat]||0)/maxC*100).toFixed(0)}%;background:${prodColors[i]};"></div>
+      </div>
+      <div class="prod-cat-num">${cats[cat]||0}</div>
+    </div>`).join('');
+  prodGrid.innerHTML += `
+    <div class="prod-card">
+      <div class="prod-header">
+        <div class="prod-name">${prod}</div>
+        <div class="prod-total">${total} VoC</div>
+      </div>
+      <div class="prod-cats">${rows}</div>
+    </div>`;
+});
+
+// ── CHARTS ──
+function makeChart(id, label, data, color){
+  const ctx = document.getElementById(id);
+  if(!ctx) return;
+  const cat = label;
+  const mu  = baseline[cat]?.mu ?? 0;
+  const s   = baseline[cat]?.sigma ?? 0;
+  new Chart(ctx,{
+    type:'line',
+    data:{
+      labels:WEEKS,
+      datasets:[
+        {
+          label:'Count',
+          data: history[cat],
+          borderColor: color,
+          backgroundColor: color+'18',
+          fill:true, tension:0.35, borderWidth:2,
+          pointRadius: history[cat].map((v,i)=>i===WEEKS.length-1?5:3),
+          pointBackgroundColor: history[cat].map(v=>{
+            const z=zscore(v,mu,s);
+            return Math.abs(z)>3?'#d63f3f':Math.abs(z)>2?'#c47a15':color;
+          }),
+        },
+        {
+          label:'Avg (μ)',
+          data: Array(WEEKS.length).fill(mu),
+          borderColor:'#b5b0a8', borderDash:[4,4],
+          borderWidth:1, pointRadius:0, fill:false,
+        },
+        {
+          label:'+2σ',
+          data:Array(WEEKS.length).fill(mu+2*s),
+          borderColor:'#f0d9a0', borderDash:[2,4],
+          borderWidth:1, pointRadius:0, fill:false,
+        },
+        {
+          label:'−2σ',
+          data:Array(WEEKS.length).fill(mu-2*s),
+          borderColor:'#b2dfc4', borderDash:[2,4],
+          borderWidth:1, pointRadius:0, fill:false,
+        }
+      ]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{ labels:{ font:{family:'DM Mono',size:10}, color:'#8a8480', boxWidth:12 }}},
+      scales:{
+        x:{ ticks:{color:'#b5b0a8',font:{family:'DM Mono',size:10}}, grid:{color:'#f0ede7'} },
+        y:{ ticks:{color:'#b5b0a8',font:{family:'DM Mono',size:10}}, grid:{color:'#f0ede7'} }
+      }
+    }
+  });
+}
+
+makeChart('chartComplaint',  'Complaint',   history['Complaint'],    '#d63f3f');
+makeChart('chartBug',        'Bug',         history['Bug'],          '#c47a15');
+makeChart('chartFeature',    'Feature Req', history['Feature Req'],  '#1e5fa8');
+makeChart('chartPraise',     'Praise',      history['Praise'],       '#2a7a4b');
+
+// ── NAV ──
+function showView(name){
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  document.getElementById('view-'+name).classList.add('active');
+  event.currentTarget.classList.add('active');
+}
+</script>
+
+</body>
+</html>
