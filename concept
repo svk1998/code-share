@@ -1,0 +1,750 @@
+# MCP Server for Test Script Generation — Technical Design
+
+## 1. Overview
+
+### 1.1 Problem Statement
+
+We have a GitHub codebase containing device driver code that exposes APIs for integrating with real hardware devices. We want an LLM to generate **correct, executable test scripts** that exercise these APIs. The two failure modes we are designing against are:
+
+1. **Hallucinated APIs** — the model invents functions, classes, or method signatures that do not exist in the codebase.
+1. **Misused APIs** — the model calls real functions with wrong arguments, in the wrong order, or in violation of repo conventions (setup, teardown, fixtures, etc.).
+
+### 1.2 Why MCP
+
+A static RAG pipeline pre-stuffs context into the prompt and hopes it is enough. The Model Context Protocol (MCP) lets the LLM **pull context on demand** through structured tool calls. The model becomes an investigator: it can look up a symbol, fetch its definition, scan callers, and confirm a call signature *before* emitting code.
+
+### 1.3 Goals
+
+- Expose the codebase as a queryable surface (semantic + structural).
+- Make the public driver API the canonical source of truth.
+- Reject generated code that references nonexistent symbols (deterministic post-check).
+- Support both interactive (Claude Desktop/Code) and automated (orchestrator) clients.
+
+### 1.4 Non-Goals
+
+- Executing tests against real devices (out of scope; handled by downstream CI).
+- Writing the codebase itself or modifying source.
+- Replacing existing CI lint/format tools.
+
+-----
+
+## 2. System Architecture
+
+```mermaid
+flowchart TB
+    subgraph SRC["Source"]
+        GH[GitHub Repo]
+        WH[Webhook events<br/>push / PR merged]
+    end
+
+    subgraph ING["Layer 1 — Ingestion"]
+        CLN[Cloner /<br/>Git fetcher]
+        PRS[Tree-sitter<br/>AST parser]
+        SYM[Symbol<br/>extractor]
+        CG[Call graph<br/>builder]
+        DOC[Docstring &<br/>comment extractor]
+    end
+
+    subgraph IDX["Layer 2 — Index"]
+        ST[(Symbol Table<br/>Postgres)]
+        VEC[(Vector Index<br/>pgvector / Qdrant)]
+        GR[(Call Graph<br/>adjacency table)]
+        MAN[(API Manifest<br/>JSON)]
+    end
+
+    subgraph MCP["Layer 3 — MCP Server"]
+        TR[Transport<br/>stdio / SSE]
+        TOOLS[Tools<br/>search / find / validate]
+        RES[Resources<br/>manifest / conventions]
+        PR[Prompts<br/>generate_test / explore]
+        CACHE[LRU cache]
+    end
+
+    subgraph CLI["Layer 4 — Client / Orchestrator"]
+        AG[Agent loop]
+        VAL[Static validator]
+        OUT[Generated test scripts]
+    end
+
+    GH --> CLN
+    WH --> CLN
+    CLN --> PRS
+    PRS --> SYM
+    PRS --> DOC
+    SYM --> CG
+    SYM --> ST
+    SYM --> MAN
+    DOC --> VEC
+    SYM --> VEC
+    CG --> GR
+
+    ST --> TOOLS
+    VEC --> TOOLS
+    GR --> TOOLS
+    MAN --> RES
+    TOOLS --> CACHE
+    TR --> TOOLS
+    TR --> RES
+    TR --> PR
+
+    AG <--> TR
+    AG --> VAL
+    VAL --> OUT
+    VAL -.reject & retry.-> AG
+```
+
+### 2.1 Data Flow Summary
+
+1. A commit lands on GitHub → webhook fires → ingestion pipeline pulls the diff.
+1. Changed files are re-parsed; symbols, docstrings, and call edges are extracted.
+1. Index stores are updated atomically (symbol table, vector index, call graph, manifest).
+1. The MCP server serves queries against these stores via standardized tool calls.
+1. The orchestrator runs an agent loop where the LLM calls MCP tools, drafts a test, and submits it to the validator.
+1. The validator confirms every call exists in the manifest; on failure, the orchestrator hands the error back to the LLM for repair.
+
+-----
+
+## 3. Layer 1 — Codebase Ingestion
+
+### 3.1 Repository Acquisition
+
+- **Initial bootstrap**: `git clone --depth=1 <repo>` for fast cold start; full history only if blame/history-aware features are added later.
+- **Incremental updates**: maintain a local mirror; on webhook, `git fetch && git diff --name-status <old>..<new>` produces the changed-file list.
+- **Branch strategy**: index `main` by default. Optionally maintain a parallel index per long-lived release branch (key the index store by `branch_id`).
+- **Storage location**: bare repo under `/var/lib/mcp/repos/<repo_id>.git`; working tree checked out per-job under a `tmpfs` to keep parsing fast and disposable.
+
+### 3.2 Language Detection & Parser Selection
+
+- Detect language by file extension first, fall back to `linguist`-style heuristics.
+- Use **tree-sitter** as the universal AST front-end. Reasons:
+  - Single API across Python, C/C++, Java, JS/TS, Go, Rust.
+  - Incremental, error-tolerant — survives syntax errors in WIP code.
+  - Fast (millions of LOC per minute).
+- Maintain a parser registry: `{ language → tree-sitter grammar }`.
+
+### 3.3 AST Parsing
+
+For each source file, produce an AST and walk it with language-specific visitors that emit a **uniform Symbol record** (see §8). The visitor extracts:
+
+- Top-level and nested function/method definitions.
+- Class definitions and their members.
+- Decorators, annotations, type hints.
+- Parameter names, defaults, kwargs, varargs.
+- Return type annotations where available.
+- Module-level constants that look like API endpoints/enums.
+
+### 3.4 Symbol Extraction Rules
+
+- **Public vs private**: leading underscore in Python, lowercase in Go, `private`/`protected` in Java/C++ → mark `visibility="private"`. Default to `public` otherwise. Driver-facing modules (configurable allowlist of paths, e.g. `drivers/`, `api/`) get a `public_api=true` flag regardless.
+- **Stable IDs**: every symbol gets a deterministic ID: `sha1(repo_id + ":" + file_path + ":" + qualified_name + ":" + start_line)`. This ID survives reformatting better than line numbers alone.
+- **Qualified names**: `package.module.Class.method`. Language-specific resolver handles imports, re-exports, aliasing.
+
+### 3.5 Call Graph Construction
+
+- For dynamic languages (Python), use static analysis (e.g. **PyCG** or Jedi-based resolution). Accept imprecision; record `confidence={high|medium|low}` per edge.
+- For typed languages (Java, Go, TS), use the language server (LSP) or compiler frontend for precise edges.
+- Store edges as `(caller_id, callee_id, call_site_line, confidence)`.
+- Treat the call graph as a directed multigraph; do not deduplicate edges that occur at different sites — the line info is useful for `find_usages`.
+
+### 3.6 Docstring & Comment Extraction
+
+- Capture the docstring/javadoc/godoc block directly attached to each symbol.
+- Capture inline comments within the body when they are within 3 lines of a parameter declaration (often documents constraints).
+- Strip markup but preserve code fences inside docstrings for embedding quality.
+
+### 3.7 Test File Discovery
+
+A separate visitor pass identifies test files via:
+
+- Path heuristics: `tests/`, `test_*.py`, `*_test.go`, `*Test.java`.
+- Framework markers: imports of `pytest`, `unittest`, `JUnit`, etc.
+- Each test function is linked to the set of non-test symbols it calls (computed from the call graph). This powers `find_tests(symbol)`.
+
+### 3.8 Incremental Updates via Webhooks
+
+- A FastAPI endpoint `/webhook/github` receives push events.
+- Verify HMAC signature, enqueue a job (Redis/Postgres queue).
+- The job computes changed files, re-parses only those, and **diff-applies** to the indexes:
+  - Symbol table: upsert by stable ID; tombstone deleted symbols.
+  - Vector index: delete-then-insert by stable ID.
+  - Call graph: delete all edges where `caller_file ∈ changed_files`, re-insert.
+- Transactional boundary: wrap symbol-table and call-graph updates in a single Postgres transaction. Vector index update is best-effort with a reconciliation sweep nightly.
+
+### 3.9 Failure Handling
+
+- Per-file parse failure → log, continue. Keep last-known-good symbols for that file marked `stale=true`.
+- Whole-repo failure → alert, fall back to previous good snapshot (indexes are versioned).
+
+-----
+
+## 4. Layer 2 — Index
+
+### 4.1 Symbol Table (Postgres)
+
+**Schema:**
+
+```sql
+CREATE TABLE symbols (
+    id              TEXT PRIMARY KEY,            -- stable sha1 ID
+    repo_id         TEXT NOT NULL,
+    branch          TEXT NOT NULL,
+    file_path       TEXT NOT NULL,
+    qualified_name  TEXT NOT NULL,
+    short_name      TEXT NOT NULL,
+    kind            TEXT NOT NULL,                -- function|method|class|constant
+    language        TEXT NOT NULL,
+    signature       TEXT,                          -- raw signature string
+    parameters      JSONB,                         -- [{name, type, default, kind}]
+    return_type     TEXT,
+    decorators      TEXT[],
+    visibility      TEXT NOT NULL,                 -- public|private
+    public_api      BOOLEAN NOT NULL DEFAULT false,
+    docstring       TEXT,
+    start_line      INT NOT NULL,
+    end_line        INT NOT NULL,
+    source_hash     TEXT NOT NULL,                 -- sha1 of body, for change detection
+    stale           BOOLEAN NOT NULL DEFAULT false,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_symbols_short_name        ON symbols (short_name);
+CREATE INDEX idx_symbols_qualified_name    ON symbols (qualified_name);
+CREATE INDEX idx_symbols_file              ON symbols (repo_id, branch, file_path);
+CREATE INDEX idx_symbols_public_api        ON symbols (public_api) WHERE public_api;
+CREATE INDEX idx_symbols_trgm_short_name   ON symbols USING gin (short_name gin_trgm_ops);
+```
+
+**Notes:**
+
+- The trigram index supports fuzzy lookups (`find_symbol("conect_dvice")` still finds `connect_device`).
+- `parameters JSONB` enables structural matching in `validate_call` without re-parsing the signature string.
+- Always filter by `repo_id` and `branch`; never query globally.
+
+### 4.2 Vector Index
+
+**Choice:** `pgvector` if you already run Postgres (one less system); Qdrant or LanceDB if you need higher QPS or filtered ANN at scale.
+
+**Chunking strategy:**
+
+- One vector per **symbol**, not per file or per fixed-size window. Symbol-granular retrieval matches how the LLM reasons.
+- Embed text composed as:
+  
+  ```
+  <qualified_name>
+  <signature>
+  <docstring>
+  <first N=40 lines of body>
+  ```
+- Truncate to embedding model’s max tokens; never split a symbol across vectors.
+
+**Embedding model:**
+
+- **Code-specialized** (preferred): a model trained on code such as a 768d or 1024d code embedding model. Generic text embeddings work but lose ~10-20% recall on identifier-heavy queries.
+- Store the model name + version with the vector row so you can detect when an index needs a full rebuild.
+
+**Schema (pgvector):**
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE symbol_embeddings (
+    symbol_id    TEXT PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+    embedding    vector(768) NOT NULL,
+    model        TEXT NOT NULL,
+    model_ver    TEXT NOT NULL,
+    embedded_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_symbol_embeddings_hnsw
+    ON symbol_embeddings USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+```
+
+**Distance metric:** cosine. Normalize embeddings at write time.
+
+**Filtered ANN:** at query time, push filters (e.g. `public_api=true`, `language='python'`) via a join with `symbols` rather than into pgvector’s filter clause to keep the recall curve healthy.
+
+### 4.3 Call Graph Storage
+
+```sql
+CREATE TABLE call_edges (
+    caller_id      TEXT NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    callee_id      TEXT NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    call_site_line INT NOT NULL,
+    confidence     TEXT NOT NULL,                  -- high|medium|low
+    PRIMARY KEY (caller_id, callee_id, call_site_line)
+);
+
+CREATE INDEX idx_call_edges_callee ON call_edges (callee_id);
+CREATE INDEX idx_call_edges_caller ON call_edges (caller_id);
+```
+
+For unresolved callees (dynamic dispatch), insert with `callee_id = NULL` and a `callee_hint` column for the best-effort name string. This still helps `find_usages` via name matching.
+
+### 4.4 API Manifest
+
+Materialized view rebuilt on every index update:
+
+```sql
+CREATE MATERIALIZED VIEW api_manifest AS
+SELECT id, qualified_name, signature, parameters, return_type, docstring, file_path, start_line
+FROM symbols
+WHERE public_api = true AND NOT stale;
+```
+
+Served as a single JSON blob via the MCP resource `api://manifest`. Refresh after every batch ingest.
+
+### 4.5 Test-to-Symbol Index
+
+```sql
+CREATE TABLE test_symbol_usage (
+    test_id      TEXT NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    target_id    TEXT NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    PRIMARY KEY (test_id, target_id)
+);
+
+CREATE INDEX idx_test_symbol_usage_target ON test_symbol_usage (target_id);
+```
+
+Built by intersecting the call graph with the set of identified test functions. Powers `find_tests(symbol)`.
+
+-----
+
+## 5. Layer 3 — MCP Server
+
+### 5.1 MCP Protocol Primer
+
+MCP defines three primitives:
+
+- **Tools** — model-invoked functions with JSON Schema inputs/outputs.
+- **Resources** — addressable read-only blobs the client can attach to the model’s context (`api://...`, `file://...`).
+- **Prompts** — named, parameterized prompt templates the client can request.
+
+The protocol is JSON-RPC 2.0 over a transport.
+
+### 5.2 Transport Selection
+
+- **stdio**: best for local clients (Claude Desktop, Claude Code, dev workflows). One process per client.
+- **SSE (Server-Sent Events) over HTTP**: best for shared/remote deployments and multi-client orchestrators. Required if the orchestrator runs on a different host.
+- Build both behind a thin transport abstraction; the tool implementations are transport-agnostic.
+
+### 5.3 Server Initialization
+
+On startup:
+
+1. Open Postgres connection pool.
+1. Open vector index client (or reuse the Postgres pool for pgvector).
+1. Warm caches: load the public API manifest into memory; preload the symbol short-name index for the hottest 10k entries.
+1. Register tool, resource, and prompt handlers.
+1. Advertise capabilities in the `initialize` handshake: `tools`, `resources`, `prompts`, and `resources/subscribe` if you support live updates.
+
+### 5.4 Tools
+
+For every tool below the description, input schema, output schema, and implementation notes are given.
+
+#### 5.4.1 `search_code`
+
+Semantic search for symbols by natural-language query or code fragment.
+
+- **Input:**
+  
+  ```json
+  {
+    "type": "object",
+    "properties": {
+      "query":     { "type": "string" },
+      "top_k":     { "type": "integer", "default": 10, "maximum": 50 },
+      "filters": {
+        "type": "object",
+        "properties": {
+          "language":   { "type": "string" },
+          "kind":       { "type": "string", "enum": ["function","method","class","constant"] },
+          "public_api": { "type": "boolean" },
+          "path_glob":  { "type": "string" }
+        }
+      }
+    },
+    "required": ["query"]
+  }
+  ```
+- **Output:** array of `{ symbol_id, qualified_name, score, signature, file_path, start_line, snippet }`.
+- **Implementation:**
+1. Embed the query with the same model used at index time.
+1. ANN search in pgvector with `LIMIT top_k * 4`.
+1. Join with `symbols`, apply filters, re-rank by a weighted score: `0.7 * cosine + 0.2 * public_api_boost + 0.1 * recency`.
+1. Truncate snippet to first ~30 lines.
+- **Performance target:** p95 < 150ms for top_k=10 on a ~1M-symbol index.
+
+#### 5.4.2 `find_symbol`
+
+Exact / fuzzy lookup by name. The **anti-hallucination primitive.**
+
+- **Input:**
+  
+  ```json
+  {
+    "type": "object",
+    "properties": {
+      "name":  { "type": "string" },
+      "kind":  { "type": "string" },
+      "fuzzy": { "type": "boolean", "default": false }
+    },
+    "required": ["name"]
+  }
+  ```
+- **Output:** array of matching symbols (empty if none — this is the signal to the LLM that the name is bogus).
+- **Implementation:** exact match on `short_name` or `qualified_name`; if `fuzzy=true`, fall back to a trigram similarity query with threshold 0.4. Always returns ≤ 20 results.
+
+#### 5.4.3 `get_definition`
+
+Full source of a symbol by ID.
+
+- **Input:** `{ "symbol_id": "string" }`.
+- **Output:** `{ symbol: SymbolRecord, source: "string", file_path: "string", start_line: int, end_line: int }`.
+- **Implementation:** read from the working tree at the indexed commit; cache by `(symbol_id, source_hash)`.
+
+#### 5.4.4 `get_callers`
+
+Who calls this symbol?
+
+- **Input:** `{ "symbol_id": "string", "depth": { "type": "integer", "default": 1, "maximum": 3 } }`.
+- **Output:** tree of callers up to `depth` with call-site lines.
+- **Implementation:** BFS on `call_edges` reversed; cap total nodes at 200 to avoid blowing context.
+
+#### 5.4.5 `get_callees`
+
+What does this symbol call?
+
+- **Input/Output:** mirror of `get_callers`.
+- **Implementation:** BFS forward; include `confidence` on edges so the LLM can discount low-confidence guesses.
+
+#### 5.4.6 `list_apis`
+
+Enumerate the public API surface of a module or directory.
+
+- **Input:** `{ "module_or_path": "string" }`.
+- **Output:** array of `{ symbol_id, qualified_name, signature, docstring_first_line }`.
+- **Implementation:** `WHERE public_api AND file_path LIKE '<path>%'`, ordered by qualified name.
+
+#### 5.4.7 `find_usages`
+
+Real call sites for a symbol.
+
+- **Input:** `{ "symbol_id": "string", "max_results": 20 }`.
+- **Output:** array of `{ caller: SymbolSummary, file_path, line, surrounding_code }`.
+- **Implementation:** join `call_edges` to `symbols`; pull a 6-line window around each call site from disk.
+
+#### 5.4.8 `find_tests`
+
+Existing tests that exercise a symbol.
+
+- **Input:** `{ "symbol_id": "string", "max_results": 10 }`.
+- **Output:** array of test SymbolRecords plus their full source (these are valuable few-shot examples).
+- **Implementation:** `SELECT test_id FROM test_symbol_usage WHERE target_id = ?`, hydrate, attach source.
+
+#### 5.4.9 `validate_call`
+
+**The most important tool.** Given a proposed call, confirm the function exists and the arguments match the signature.
+
+- **Input:**
+  
+  ```json
+  {
+    "type": "object",
+    "properties": {
+      "name":     { "type": "string" },
+      "args":     { "type": "array",  "items": {} },
+      "kwargs":   { "type": "object" }
+    },
+    "required": ["name"]
+  }
+  ```
+- **Output:**
+  
+  ```json
+  {
+    "exists":           "boolean",
+    "matches":          "boolean",
+    "candidates":       [ { "qualified_name": "...", "signature": "..." } ],
+    "errors":           [ "missing required parameter 'device_id'", "..."],
+    "suggested_call":   "string"
+  }
+  ```
+- **Implementation:**
+1. Resolve `name` via `find_symbol` (exact first, then fuzzy).
+1. If none found → `exists=false`, return 5 nearest fuzzy matches as candidates.
+1. If found, structurally compare `args/kwargs` against `parameters` JSONB:
+  - Check arity (varargs/kwargs flags handled).
+  - Check required parameters are present.
+  - Check no unknown kwargs.
+  - Do **not** check value types (too noisy); only structure.
+1. Emit human-readable `errors` and a `suggested_call` string the LLM can paste.
+
+This tool is **deterministic and cheap**, so the orchestrator can call it on every emitted call site, not just at the end.
+
+#### 5.4.10 `read_file`
+
+Surgical reads.
+
+- **Input:** `{ "path": "string", "start_line": int, "end_line": int }`.
+- **Output:** `{ "content": "string", "language": "string" }`.
+- **Guardrails:** reject paths outside the repo working tree; cap `end_line - start_line` at 500.
+
+### 5.5 Resources
+
+|URI                 |Content                                        |Cache TTL|
+|--------------------|-----------------------------------------------|---------|
+|`api://manifest`    |Full public API manifest as JSON               |60s      |
+|`api://conventions` |Hand-written or auto-mined repo conventions doc|24h      |
+|`api://capabilities`|Device → supported-APIs matrix (if applicable) |24h      |
+|`file://<path>`     |Raw file content at HEAD                       |60s      |
+
+Conventions can be authored manually (a `MCP_CONVENTIONS.md` checked into the repo) or mined by clustering common test patterns (fixtures, decorators) — start manual, automate later.
+
+### 5.6 Prompts
+
+#### 5.6.1 `generate_test`
+
+Parameterized template:
+
+```
+Inputs: target_api, scenario_type (smoke|regression|edge), constraints
+Instructions to model:
+  1. Call list_apis on the target module.
+  2. For target_api, call find_symbol then get_definition.
+  3. Call find_tests(target_api). Treat returned tests as authoritative style examples.
+  4. Draft the test. For every function call you write, call validate_call first.
+  5. Return the final test code only after every validate_call returned matches=true.
+```
+
+#### 5.6.2 `explore_module`
+
+For new contributors / new modules. Drives a structured tour: top-level APIs → key classes → typical fixtures → one example test.
+
+### 5.7 Error Handling
+
+- Every tool returns JSON-RPC errors with stable codes:
+  - `40001` invalid input shape
+  - `40401` symbol not found
+  - `42901` rate limited
+  - `50001` internal (DB unreachable, etc.)
+- Never throw raw stack traces back to the client.
+- Errors must include a `hint` field with the next action the model could try.
+
+### 5.8 Caching
+
+- Process-local LRU cache keyed by tool name + input hash, TTL 30s for hot reads.
+- `get_definition` cache keyed by `(symbol_id, source_hash)` — effectively infinite TTL since the hash changes when content changes.
+- Resource cache shared across tools.
+
+### 5.9 Observability
+
+- Structured logs per tool call: `{ tool, input_hash, latency_ms, result_size, client_id }`.
+- Counter metrics: calls/sec, error rate, cache hit rate.
+- Trace mode: when enabled per session, persist every tool call and result for later replay/debugging — invaluable for tuning the agentic loop.
+
+### 5.10 Concurrency & Limits
+
+- Per-client concurrency cap (e.g. 8 in-flight tool calls) to prevent runaway agents.
+- Global rate limit on `search_code` (embedding calls cost money/GPU).
+- Tool timeout: 5s default; 15s for `search_code`.
+
+-----
+
+## 6. Layer 4 — Orchestrator / Client
+
+### 6.1 Operating Modes
+
+- **Agentic mode**: the LLM decides which tools to call and when. Use for first-time generation, exploration, debugging. Higher latency, higher quality.
+- **Fixed-pipeline mode**: the orchestrator runs a canned sequence (`list_apis` → `find_symbol` → `find_tests` → generate → validate) regardless of model preference. Use for bulk regeneration where determinism matters.
+
+Both modes hit the same MCP server.
+
+### 6.2 Agentic Loop
+
+1. Send the `generate_test` prompt with parameters.
+1. Stream the model’s response; intercept tool calls.
+1. Execute each tool call against the MCP server; feed the result back.
+1. When the model emits final code, hand off to the validator.
+1. If validation fails, append the validator error to the conversation and continue the loop (cap iterations at e.g. 6).
+
+### 6.3 Static Validator (Post-Generation)
+
+Independent of the LLM, run as the last gate:
+
+1. Parse the generated test with tree-sitter.
+1. Walk the AST and collect every call expression.
+1. For each call, look up the target in the symbol table:
+- Unknown name → fail.
+- Known name, arity/kwargs mismatch → fail.
+1. Check required imports are satisfiable (every imported name maps to a real symbol or third-party package on the allowlist).
+1. Return a structured report: `{ ok: bool, failures: [...] }`.
+
+This validator is **the same logic as `validate_call`, run over the whole file.** A hallucinated symbol cannot escape both the per-call check and the file-level sweep.
+
+### 6.4 Output Handling
+
+- On success: write the test to a configured path, optionally open a PR via GitHub API.
+- On final failure (after retries): return the best draft plus the validator report so a human can repair.
+
+-----
+
+## 7. Anti-Hallucination Strategy (Summary)
+
+|Layer       |Defense                                                                          |
+|------------|---------------------------------------------------------------------------------|
+|Retrieval   |Symbol-granular embeddings; public-API boost in re-ranking                       |
+|Prompt      |`generate_test` template forces `validate_call` before every emitted call        |
+|Runtime tool|`validate_call` returns deterministic exists/matches verdict and fuzzy candidates|
+|Surface     |Private symbols hidden by default; only `public_api=true` returned in `list_apis`|
+|Post-gen    |Whole-file static validator re-checks every call against the symbol table        |
+|Loop        |Failed validation is fed back into the agent loop with the structured error      |
+
+Three independent layers (retrieval, in-loop validation, post-gen validation) must all fail for a hallucination to ship.
+
+-----
+
+## 8. Data Schemas Reference
+
+### 8.1 `SymbolRecord` (canonical)
+
+```json
+{
+  "id":             "string",
+  "repo_id":        "string",
+  "branch":         "string",
+  "file_path":      "string",
+  "qualified_name": "string",
+  "short_name":     "string",
+  "kind":           "function|method|class|constant",
+  "language":       "string",
+  "signature":      "string",
+  "parameters": [
+    {
+      "name":    "string",
+      "type":    "string|null",
+      "default": "string|null",
+      "kind":    "positional|keyword|varargs|kwargs"
+    }
+  ],
+  "return_type":  "string|null",
+  "decorators":   ["string"],
+  "visibility":   "public|private",
+  "public_api":   "boolean",
+  "docstring":    "string|null",
+  "start_line":   "integer",
+  "end_line":     "integer",
+  "source_hash":  "string",
+  "stale":        "boolean"
+}
+```
+
+### 8.2 `CallEdge`
+
+```json
+{
+  "caller_id":      "string",
+  "callee_id":      "string | null",
+  "callee_hint":    "string | null",
+  "call_site_line": "integer",
+  "confidence":     "high|medium|low"
+}
+```
+
+### 8.3 `ValidationReport`
+
+```json
+{
+  "ok": "boolean",
+  "failures": [
+    {
+      "kind":   "unknown_symbol|arity_mismatch|unknown_kwarg|missing_required",
+      "call":   "string",
+      "line":   "integer",
+      "detail": "string",
+      "suggestions": ["string"]
+    }
+  ]
+}
+```
+
+-----
+
+## 9. Security & Operations
+
+### 9.1 AuthN/AuthZ
+
+- For local stdio transport, trust the OS user.
+- For SSE/HTTP, require a bearer token; map tokens to `repo_id` allowlists.
+- Never embed credentials in tool outputs.
+
+### 9.2 Secrets in the Codebase
+
+- Run a pre-index secret scanner (gitleaks / trufflehog). Quarantine files with secret hits — index their structure but redact bodies before returning via `get_definition` or `read_file`.
+
+### 9.3 Path Traversal
+
+- `read_file` paths are resolved against the repo root with `realpath`; reject any result outside the root.
+
+### 9.4 Resource Limits
+
+- Memory: cap working set per query; reject queries whose projected result exceeds N bytes.
+- Disk: rotate trace logs; cap at 7 days.
+
+### 9.5 Deployment Topology
+
+- One MCP server process per repo, or a multi-tenant server keyed by `repo_id` in every tool input. Single-tenant is simpler and recommended for the first version.
+- Run behind a process supervisor; health endpoint pings Postgres and the vector index.
+
+### 9.6 Index Versioning
+
+- Stamp every index store with `index_version`. Bump on schema changes or embedding model changes. Server refuses to start if stamps disagree across stores.
+
+-----
+
+## 10. Testing the MCP Server Itself
+
+### 10.1 Unit Tests
+
+- Per-tool tests with mocked storage.
+- Schema conformance: every tool’s output validated against its declared JSON Schema.
+
+### 10.2 Integration Tests
+
+- A small fixture repo (~50 files, several known APIs, several known tests) checked into the project. Spin up Postgres + vector index in Docker, ingest the fixture, run a battery of queries with golden outputs.
+
+### 10.3 Hallucination Regression Suite
+
+- A list of known-bad function names (`conect_devicee`, `setupp`, etc.). Every release must return `exists=false` with sensible candidates.
+
+### 10.4 End-to-End Generation Tests
+
+- 20 representative test-generation scenarios. For each, run the full agentic loop; assert the validator passes and the generated test imports run (compile/parse only, not device-execute).
+
+### 10.5 Performance Tests
+
+- p50/p95/p99 per tool at target QPS.
+- Cold-cache and warm-cache numbers reported separately.
+
+-----
+
+## Appendix A — Example Tool-Call Trace
+
+A successful generation might look like:
+
+1. `list_apis(module_or_path="drivers/wifi")` → 14 APIs.
+1. `find_symbol(name="connect_ap")` → 1 match.
+1. `get_definition(symbol_id=...)` → signature + docstring.
+1. `find_tests(symbol_id=...)` → 3 existing tests.
+1. (Model drafts a test internally.)
+1. `validate_call(name="connect_ap", kwargs={"ssid":"x","timeout":30})` → `matches=true`.
+1. `validate_call(name="disconnect", args=[])` → `matches=true`.
+1. Model emits final test.
+1. Static validator runs over the file → `ok=true`.
+1. Test written.
+
+## Appendix B — Open Design Questions
+
+- Multi-language repos: should the call graph be unified or per-language? Recommend per-language for now; cross-language FFI bridges modeled as `callee_hint` only.
+- Branch-aware queries: do we ever want the LLM to see two branches at once (e.g. for migration tests)? If yes, add a `branch` filter to every tool; otherwise pin per session.
+- Live coding: if the developer is editing locally, do we serve from disk or from the indexed snapshot? Snapshot is consistent; disk is fresh. Recommend snapshot with a `refresh()` tool for explicit re-index of a file.
