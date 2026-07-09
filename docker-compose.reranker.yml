@@ -22,3 +22,9 @@ services:
               device_ids: ["3"]
               capabilities: [gpu]
     restart: unless-stopped
+
+
+# curl http://localhost:8001/rerank \
+#  -H "Content-Type: application/json" \
+#  -d '{"model": "qwen3-reranker", "query": "test", "documents": ["a", "b"]}'
+
